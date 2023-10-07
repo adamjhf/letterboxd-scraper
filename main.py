@@ -12,42 +12,50 @@ USER_RATING_URL = (
     BASE_URL +
     "{user}/films/rated/0.5-5.0/by/rated-date/size/large/page/{page}/")
 POPULAR_MEMBERS_URL = BASE_URL + "members/popular/this/all-time/page/{page}/"
+MAX_USERS_CONCURRENCY = 40
+MAX_POPULAR_USER_CONCURRENCY = 2
 
 pool: psycopg_pool.ConnectionPool = psycopg_pool.ConnectionPool("", open=False)
 user_queue: asyncio.Queue[str] = asyncio.Queue()
 
 
-async def get_popular_users(client: aiohttp.ClientSession) -> None:
+async def get_popular_users(client: aiohttp.ClientSession,
+                            sem: asyncio.Semaphore) -> None:
     users_to_update = db_get_users_to_update()
     for u in users_to_update:
         await user_queue.put(u)
     user_cache = db_get_cached_users()
     urls = [POPULAR_MEMBERS_URL.format(page=page) for page in range(1, 257)]
-    pu = [put_users(client, url, users_to_update + user_cache) for url in urls]
+    pu = [
+        put_users(client, url, users_to_update + user_cache, sem)
+        for url in urls
+    ]
     await asyncio.gather(*pu)
 
 
-async def consume_users(client: aiohttp.ClientSession) -> None:
+async def consume_users(client: aiohttp.ClientSession,
+                        sem: asyncio.Semaphore) -> None:
     while True:
         user = await user_queue.get()
-        asyncio.create_task(start_get_user_ratings(client, user))
+        asyncio.create_task(start_get_user_ratings(client, user, sem))
 
 
-async def start_get_user_ratings(client: aiohttp.ClientSession,
-                                 user: str) -> None:
-    url = USER_RATING_URL.format(user=user, page=1)
-    doc = await fetch(client, url)
-    pages = doc.cssselect("div.paginate-pages a")
-    total_pages = 1 if len(pages) == 0 else int(pages[-1].text_content())
-    gur = [
-        get_user_ratings(client, user, page)
-        for page in range(2, total_pages + 1)
-    ]
-    results = await asyncio.gather(get_user_ratings(client, user, 1, doc),
-                                   *gur)
-    ratings = [rating for result in results for rating in result]
-    db_add_user_ratings(user, ratings)
-    user_queue.task_done()
+async def start_get_user_ratings(client: aiohttp.ClientSession, user: str,
+                                 sem: asyncio.Semaphore) -> None:
+    async with sem:
+        url = USER_RATING_URL.format(user=user, page=1)
+        doc = await fetch(client, url)
+        pages = doc.cssselect("div.paginate-pages a")
+        total_pages = 1 if len(pages) == 0 else int(pages[-1].text_content())
+        gur = [
+            get_user_ratings(client, user, page)
+            for page in range(2, total_pages + 1)
+        ]
+        results = await asyncio.gather(get_user_ratings(client, user, 1, doc),
+                                       *gur)
+        ratings = [rating for result in results for rating in result]
+        db_add_user_ratings(user, ratings)
+        user_queue.task_done()
 
 
 async def get_user_ratings(client: aiohttp.ClientSession,
@@ -68,13 +76,14 @@ async def get_user_ratings(client: aiohttp.ClientSession,
 
 
 async def put_users(client: aiohttp.ClientSession, url: str,
-                    existing_users: list[str]) -> None:
-    doc = await fetch(client, url)
-    els = doc.cssselect("table.person-table a.name")
-    users = [el.get("href").strip("/") for el in els]
-    new_users = [u for u in users if u not in existing_users]
-    [await user_queue.put(u) for u in new_users]
-    db_add_users(new_users)
+                    existing_users: list[str], sem: asyncio.Semaphore) -> None:
+    async with sem:
+        doc = await fetch(client, url)
+        els = doc.cssselect("table.person-table a.name")
+        users = [el.get("href").strip("/") for el in els]
+        new_users = [u for u in users if u not in existing_users]
+        [await user_queue.put(u) for u in new_users]
+        db_add_users(new_users)
 
 
 async def fetch(client: aiohttp.ClientSession, url: str) -> HtmlElement:
@@ -93,8 +102,11 @@ async def main():
         timeout = aiohttp.ClientTimeout(total=None)
         async with aiohttp.ClientSession(connector=http_conn,
                                          timeout=timeout) as client:
-            asyncio.create_task(consume_users(client))
-            await get_popular_users(client)
+            asyncio.create_task(
+                consume_users(client,
+                              asyncio.Semaphore(MAX_USERS_CONCURRENCY)))
+            await get_popular_users(
+                client, asyncio.Semaphore(MAX_POPULAR_USER_CONCURRENCY))
             await user_queue.join()
 
 
@@ -122,11 +134,6 @@ def db_add_users(users: list[str]) -> None:
 def db_add_user_ratings(user: str, ratings: list[tuple[str, float]]) -> None:
     start_time = time.time()
     with pool.connection() as conn:
-        #conn.cursor().executemany(
-        #    """INSERT INTO ratings (user_name, film_id, rating)
-        #       VALUES(%s, %s, %s)
-        #       ON CONFLICT DO NOTHING""",
-        #    [(user, r[0], r[1]) for r in ratings])
         with conn.cursor(
         ).copy("COPY ratings (user_name, film_id, rating) FROM STDIN") as copy:
             for r in ratings:
