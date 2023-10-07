@@ -9,6 +9,8 @@ python = ">=3.10.0,<3.11"
 aiohttp = "^3.8.5"
 lxml = "^4.9.3"
 cssselect = "^1.2.0"
+psycopg = {extras = ["binary"], version = "^3.1.12"}
+psycopg-pool = "^3.1.8"
 
 [tool.pyright]
 # https://github.com/microsoft/pyright/blob/main/docs/configuration.md

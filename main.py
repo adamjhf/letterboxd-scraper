@@ -2,6 +2,8 @@ import asyncio
 import time
 
 import aiohttp
+import psycopg
+import psycopg_pool
 from lxml.html import HtmlElement, document_fromstring
 
 LIMIT_PER_HOST = 60
@@ -11,13 +13,17 @@ USER_RATING_URL = (
     "{user}/films/rated/0.5-5.0/by/rated-date/size/large/page/{page}/")
 POPULAR_MEMBERS_URL = BASE_URL + "members/popular/this/all-time/page/{page}/"
 
+pool: psycopg_pool.ConnectionPool = psycopg_pool.ConnectionPool("", open=False)
 user_queue: asyncio.Queue[str] = asyncio.Queue()
-ratings: list[tuple[str, str, float]] = []
 
 
 async def get_popular_users(client: aiohttp.ClientSession) -> None:
-    urls = [POPULAR_MEMBERS_URL.format(page=page) for page in range(1, 2)]
-    pu = [put_users(client, url) for url in urls]
+    users_to_update = db_get_users_to_update()
+    for u in users_to_update:
+        await user_queue.put(u)
+    user_cache = db_get_cached_users()
+    urls = [POPULAR_MEMBERS_URL.format(page=page) for page in range(1, 257)]
+    pu = [put_users(client, url, users_to_update + user_cache) for url in urls]
     await asyncio.gather(*pu)
 
 
@@ -37,30 +43,38 @@ async def start_get_user_ratings(client: aiohttp.ClientSession,
         get_user_ratings(client, user, page)
         for page in range(2, total_pages + 1)
     ]
-    await asyncio.gather(get_user_ratings(client, user, 1, doc), *gur)
+    results = await asyncio.gather(get_user_ratings(client, user, 1, doc),
+                                   *gur)
+    ratings = [rating for result in results for rating in result]
+    db_add_user_ratings(user, ratings)
     user_queue.task_done()
-    print(f"Got ratings for user {user}")
 
 
 async def get_user_ratings(client: aiohttp.ClientSession,
                            user: str,
                            page: int,
-                           doc: HtmlElement = None) -> None:
+                           doc: HtmlElement = None) -> list[tuple[str, float]]:
     if doc is None:
         url = USER_RATING_URL.format(user=user, page=page)
         doc = await fetch(client, url)
     list_items = doc.cssselect("ul.poster-list > li.poster-container")
+    ratings: list[tuple[str, float]] = []
     for li in list_items:
         film_id = li.cssselect("div.film-poster")[0].get("data-film-slug")
         stars = li.cssselect("p > span.rating")[0].text_content()
         rating = stars_to_rating(stars)
-        ratings.append((user, film_id, rating))
+        ratings.append((film_id, rating))
+    return ratings
 
 
-async def put_users(client: aiohttp.ClientSession, url: str) -> None:
+async def put_users(client: aiohttp.ClientSession, url: str,
+                    existing_users: list[str]) -> None:
     doc = await fetch(client, url)
-    users = doc.cssselect("table.person-table a.name")
-    [await user_queue.put(u.get("href").strip("/")) for u in users]
+    els = doc.cssselect("table.person-table a.name")
+    users = [el.get("href").strip("/") for el in els]
+    new_users = [u for u in users if u not in existing_users]
+    [await user_queue.put(u) for u in new_users]
+    db_add_users(new_users)
 
 
 async def fetch(client: aiohttp.ClientSession, url: str) -> HtmlElement:
@@ -73,13 +87,76 @@ def stars_to_rating(stars: str) -> float:
 
 
 async def main():
-    conn = aiohttp.TCPConnector(limit_per_host=LIMIT_PER_HOST)
-    async with aiohttp.ClientSession(connector=conn) as client:
-        asyncio.create_task(consume_users(client))
-        await get_popular_users(client)
-        await user_queue.join()
-    print(ratings[:20])
-    print(len(ratings))
+    with pool:
+        db_create_schema()
+        http_conn = aiohttp.TCPConnector(limit_per_host=LIMIT_PER_HOST)
+        timeout = aiohttp.ClientTimeout(total=None)
+        async with aiohttp.ClientSession(connector=http_conn,
+                                         timeout=timeout) as client:
+            asyncio.create_task(consume_users(client))
+            await get_popular_users(client)
+            await user_queue.join()
+
+
+def db_get_users_to_update() -> list[str]:
+    with pool.connection() as conn:
+        cur = conn.execute(
+            "SELECT user_name FROM users WHERE last_updated IS NULL")
+        return [row[0] for row in cur]
+
+
+def db_get_cached_users() -> list[str]:
+    with pool.connection() as conn:
+        cur = conn.execute(
+            "SELECT user_name FROM users WHERE last_updated IS NOT NULL")
+        return [row[0] for row in cur]
+
+
+def db_add_users(users: list[str]) -> None:
+    with pool.connection() as conn:
+        conn.cursor().executemany(
+            "INSERT INTO users (user_name) VALUES(%s) ON CONFLICT DO NOTHING",
+            [(u, ) for u in users])
+
+
+def db_add_user_ratings(user: str, ratings: list[tuple[str, float]]) -> None:
+    start_time = time.time()
+    with pool.connection() as conn:
+        #conn.cursor().executemany(
+        #    """INSERT INTO ratings (user_name, film_id, rating)
+        #       VALUES(%s, %s, %s)
+        #       ON CONFLICT DO NOTHING""",
+        #    [(user, r[0], r[1]) for r in ratings])
+        with conn.cursor(
+        ).copy("COPY ratings (user_name, film_id, rating) FROM STDIN") as copy:
+            for r in ratings:
+                copy.write_row((user, r[0], r[1]))
+        db_update_user_time(user, conn)
+    print(f"Added {user} ratings in db in: {time.time() - start_time}s")
+
+
+def db_update_user_time(user: str, conn: psycopg.Connection) -> None:
+    conn.execute(
+        "UPDATE users SET last_updated = CURRENT_TIMESTAMP WHERE user_name = %s",
+        (user, ))
+
+
+def db_create_schema() -> None:
+    with pool.connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_name    VARCHAR(255) PRIMARY KEY NOT NULL,
+                last_updated TIMESTAMP NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ratings (
+                user_name VARCHAR(255) NOT NULL,
+                film_id   VARCHAR(255) NOT NULL,
+                rating    NUMERIC(3, 1) NOT NULL,
+                PRIMARY KEY (user_name, film_id)
+            )
+        """)
 
 
 if __name__ == "__main__":
