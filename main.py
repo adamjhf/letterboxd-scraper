@@ -51,6 +51,7 @@ async def consume_users(client: aiohttp.ClientSession,
 async def start_get_user_ratings(client: aiohttp.ClientSession, user: str,
                                  sem: asyncio.Semaphore) -> None:
     try:
+        
         async with sem:
             url = USER_RATING_URL.format(user=user, page=1)
             doc = await fetch(client, url)
@@ -119,7 +120,7 @@ async def main():
                               asyncio.Semaphore(MAX_USERS_CONCURRENCY)))
             await get_popular_users(
                 client, asyncio.Semaphore(MAX_POPULAR_USER_CONCURRENCY))
-    await user_queue.join()
+            await user_queue.join()
 
 
 def db_get_users_to_update() -> list[str]:
