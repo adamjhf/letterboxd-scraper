@@ -9,11 +9,11 @@ from lxml.html import HtmlElement, document_fromstring
 
 LIMIT_PER_HOST = 60
 MAX_USERS_CONCURRENCY = 40
-MAX_POPULAR_USER_CONCURRENCY = 2
+MAX_POPULAR_USER_CONCURRENCY = 4
 BASE_URL = "http://letterboxd.com/"
 USER_RATING_URL = (
     BASE_URL +
-    "{user}/films/rated/0.5-5.0/by/rated-date/size/large/page/{page}/")
+    "{user}/films/rated/0.5-5.0/by/rated-date/page/{page}/")
 ALLTIME_POPULAR_URL = BASE_URL + "members/popular/this/all-time/page/{page}/"
 WEEKLY_POPULAR_URL = BASE_URL + "members/popular/this/week/page/{page}/"
 
@@ -25,11 +25,14 @@ async def get_popular_users(client: aiohttp.ClientSession,
                             sem: asyncio.Semaphore) -> None:
     users_to_update = db_get_users_to_update()
     if len(users_to_update) > 0:
-        print(f"{datetime.now()}: queueing {users_to_update} users")
+        print(f"{datetime.now()}: queueing {len(users_to_update)} users")
     for u in users_to_update:
         await user_queue.put(u)
     user_cache = db_get_cached_users()
-    urls = [ALLTIME_POPULAR_URL.format(page=page) for page in range(1, 257)]
+    urls = [
+        url.format(page=page) for page in range(1, 257)
+        for url in [ALLTIME_POPULAR_URL, WEEKLY_POPULAR_URL]
+    ]
     pu = [
         put_users(client, url, users_to_update + user_cache, sem)
         for url in urls
@@ -90,7 +93,7 @@ async def put_users(client: aiohttp.ClientSession, url: str,
         users = [el.get("href").strip("/") for el in els]
         new_users = [u for u in users if u not in existing_users]
         if len(new_users) > 0:
-            print(f"{datetime.now()}: queueing {new_users} users")
+            print(f"{datetime.now()}: queueing {len(new_users)} users")
         [await user_queue.put(u) for u in new_users]
         db_add_users(new_users)
 
@@ -137,14 +140,15 @@ def db_add_users(users: list[str]) -> None:
     with pool.connection() as conn:
         conn.cursor().executemany(
             "INSERT INTO users (user_name) VALUES(%s) ON CONFLICT DO NOTHING",
-            [(u, ) for u in users])
+            [[u] for u in users])
 
 
 def db_add_user_ratings(user: str, ratings: list[tuple[str, float]]) -> None:
     start_time = time.time()
     with pool.connection() as conn:
-        with conn.cursor(
-        ).copy("COPY ratings (user_name, film_id, rating) FROM STDIN") as copy:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM ratings WHERE user_name = %s", [user])
+        with cur.copy("COPY ratings (user_name, film_id, rating) FROM STDIN") as copy:
             for r in ratings:
                 copy.write_row((user, r[0], r[1]))
         db_update_user_time(user, conn)
@@ -156,7 +160,7 @@ def db_add_user_ratings(user: str, ratings: list[tuple[str, float]]) -> None:
 def db_update_user_time(user: str, conn: psycopg.Connection) -> None:
     conn.execute(
         "UPDATE users SET last_updated = CURRENT_TIMESTAMP WHERE user_name = %s",
-        (user, ))
+        [user])
 
 
 def db_create_schema() -> None:
@@ -180,4 +184,4 @@ def db_create_schema() -> None:
 if __name__ == "__main__":
     start_time = time.time()
     asyncio.run(main())
-    print(f"Runtime: {time.time() - start_time}s")
+    print(f"{datetime.now()}: completed in {time.time() - start_time}s")
