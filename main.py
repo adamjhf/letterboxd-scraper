@@ -29,6 +29,7 @@ logging.basicConfig(
     format="%(asctime)s.%(msecs)03d %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger()
+logging.getLogger("asyncio").setLevel(logging.INFO)
 
 
 async def get_popular_users(client: aiohttp.ClientSession,
@@ -43,11 +44,12 @@ async def get_popular_users(client: aiohttp.ClientSession,
         url.format(page=page) for page in range(1, 257)
         for url in [ALLTIME_POPULAR_URL, WEEKLY_POPULAR_URL]
     ]
-    pu = [
-        put_users(client, url, users_to_update + user_cache, sem)
+    tasks = [
+        asyncio.create_task(
+            put_users(client, url, users_to_update + user_cache, sem))
         for url in urls
     ]
-    await asyncio.gather(*pu)
+    await asyncio.gather(*tasks)
     log.debug("completed getting popular users")
 
 
@@ -65,17 +67,17 @@ async def start_get_user_ratings(client: aiohttp.ClientSession, user: str,
         async with sem:
             url = USER_RATING_URL.format(user=user, page=1)
             doc = await fetch(client, url)
-            pages = doc.cssselect("div.paginate-pages a")
-            total_pages = 1 if len(pages) == 0 else int(
-                pages[-1].text_content())
-            gur = [
-                get_user_ratings(client, user, page)
-                for page in range(2, total_pages + 1)
-            ]
-            results = await asyncio.gather(
-                get_user_ratings(client, user, 1, doc), *gur)
-            ratings = [rating for result in results for rating in result]
-            db_add_user_ratings(user, ratings)
+        pages = doc.cssselect("div.paginate-pages a")
+        total_pages = 1 if len(pages) == 0 else int(pages[-1].text_content())
+        tasks = [
+            asyncio.create_task(get_user_ratings(client, user, page))
+            for page in range(2, total_pages + 1)
+        ]
+        tasks.append(
+            asyncio.create_task(get_user_ratings(client, user, 1, doc)))
+        results = await asyncio.gather(*tasks)
+        ratings = [rating for result in results for rating in result]
+        db_add_user_ratings(user, ratings)
     finally:
         user_queue.task_done()
 
@@ -101,13 +103,13 @@ async def put_users(client: aiohttp.ClientSession, url: str,
                     existing_users: list[str], sem: asyncio.Semaphore) -> None:
     async with sem:
         doc = await fetch(client, url)
-        els = doc.cssselect("table.person-table a.name")
-        users = [el.get("href").strip("/") for el in els]
-        new_users = [u for u in users if u not in existing_users]
-        if len(new_users) > 0:
-            log.debug(f"queueing {len(new_users)} users")
-        [await user_queue.put(u) for u in new_users]
-        db_add_users(new_users)
+    els = doc.cssselect("table.person-table a.name")
+    users = [el.get("href").strip("/") for el in els]
+    new_users = [u for u in users if u not in existing_users]
+    if len(new_users) > 0:
+        log.debug(f"queueing {len(new_users)} users")
+    [await user_queue.put(u) for u in new_users]
+    db_add_users(new_users)
 
 
 async def get_new_films(client: aiohttp.ClientSession,
@@ -116,9 +118,9 @@ async def get_new_films(client: aiohttp.ClientSession,
     film_ids = db_get_new_films_from_ratings()
     log.debug(f"got {len(film_ids)} films from db ratings")
     batch_size = 2000
-    for i in range(1, ceil(len(film_ids) / batch_size) + 1):
+    for i in range(ceil(len(film_ids) / batch_size)):
         tasks = [
-            asyncio.ensure_future(get_film(client, f, sem))
+            asyncio.create_task(get_film(client, f, sem))
             for f in film_ids[i * batch_size:(i + 1) * batch_size]
         ]
         films = await asyncio.gather(*tasks)
@@ -130,15 +132,15 @@ async def get_film(client: aiohttp.ClientSession, film_id: str,
                    sem: asyncio.Semaphore) -> tuple[str, str, int | None, str]:
     async with sem:
         doc = await fetch(client, FILM_URL.format(film_id=film_id))
-        div = doc.cssselect("div.film-poster")[0]
-        film_name = div.get("data-film-name")
-        try:
-            year = int(div.get("data-film-release-year"))
-        except ValueError:
-            year = None
-        img = div.cssselect("img.image")[0]
-        poster_url = img.get("src")
-        return (film_id, film_name, year, poster_url)
+    div = doc.cssselect("div.film-poster")[0]
+    film_name = div.get("data-film-name")
+    try:
+        year = int(div.get("data-film-release-year"))
+    except ValueError:
+        year = None
+    img = div.cssselect("img.image")[0]
+    poster_url = img.get("src")
+    return (film_id, film_name, year, poster_url)
 
 
 async def fetch(client: aiohttp.ClientSession, url: str) -> HtmlElement:
@@ -157,11 +159,11 @@ async def main():
         timeout = aiohttp.ClientTimeout(total=None)
         async with aiohttp.ClientSession(connector=http_conn,
                                          timeout=timeout) as client:
-            #conc = MAX_CONCURRENCY - MAX_POPULAR_USER_CONCURRENCY
-            #asyncio.create_task(consume_users(client, asyncio.Semaphore(conc)))
-            #await get_popular_users(
-            #    client, asyncio.Semaphore(MAX_POPULAR_USER_CONCURRENCY))
-            #await user_queue.join()
+            conc = MAX_CONCURRENCY - MAX_POPULAR_USER_CONCURRENCY
+            asyncio.create_task(consume_users(client, asyncio.Semaphore(conc)))
+            await get_popular_users(
+                client, asyncio.Semaphore(MAX_POPULAR_USER_CONCURRENCY))
+            await user_queue.join()
             await get_new_films(client, asyncio.Semaphore(MAX_CONCURRENCY))
 
 
@@ -252,4 +254,4 @@ if __name__ == "__main__":
     log.info("starting scrape")
     start_time = time.time()
     asyncio.run(main())
-    log.info("completed in {time.time() - start_time}s")
+    log.info(f"completed in {time.time() - start_time}s")
